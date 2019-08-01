@@ -12,6 +12,8 @@ from skimage.feature import peak_local_max
 
 from scipy.spatial.distance import cosine
 
+import gc
+
 
 class PeakRegion(object):
     """a rectangle region for a single peak"""
@@ -333,7 +335,7 @@ def get_local_peaks(xic_2d, coordinates, frame_pad=50, scan_pad=100, npeaks_per_
             plt.show()
     return local_peaks
 
-def collect_peaks(xic_by_mzbin, mzbins, num_frames, num_scans, 
+def collect_peaks(uimf_reader, xic_by_mzbin, mzbins, mono_info, num_frames, num_scans, 
                   global_min_distance=20, local_min_distance=20, num_top_peaks=20, 
                   num_global_peaks=20, frames_for_peak=None, scans_for_peak=None,
                   masking_threshold=0.01, th_peak_area=0, moving_avg_size=20, debug=False):
@@ -381,7 +383,11 @@ def collect_peaks(xic_by_mzbin, mzbins, num_frames, num_scans,
 
     local_peaks_df = pd.DataFrame(local_peaks).drop_duplicates()
     local_peaks_df = local_peaks_df.astype(np.uint32)
-    return local_peaks_df.sort_values('peak_area', ascending=False).head(num_top_peaks).to_dict(orient='record')
+    local_peaks = local_peaks_df.sort_values('peak_area', ascending=False).to_dict(orient='record')
+
+    # filter by checking the charge states
+    local_peaks = check_charge_states(uimf_reader, local_peaks, mono_info, num_peaks=num_top_peaks)
+    return local_peaks
 
 def get_mz_peaks(reader, frame_arr, scan_arr, int_arr, mzbin_ranges_by_params, xic_by_mzbin, th=50):
     for f, s, i in zip(frame_arr, scan_arr, int_arr):
@@ -430,61 +436,101 @@ def get_signals_in_peak_region(reader, peak_region, mz, z, isotope, ppm, sig_th=
     
     return xic_by_mzbin
 
-def compute_isotope_cosine(xic2d_mono, xic2d_iso, peak_region):
-    mono_vec = xic2d_mono[peak_region.frame_start:peak_region.frame_end,peak_region.scan_start:peak_region.scan_end]
-    mono_lc_chrom = mono_vec.sum(axis=1)
-    # mono_mobility = mono_vec.sum(axis=0)
-    mono_area = mono_lc_chrom.sum()
-    
+def compute_isotope_cosine(mono_vec, mono_lc_chrom, xic2d_iso, peak_region):
     iso_vec = xic2d_iso[peak_region.frame_start:peak_region.frame_end,peak_region.scan_start:peak_region.scan_end]
     iso_lc_chrom = iso_vec.sum(axis=1)
     # iso_mobility = iso_vec.sum(axis=0)
     iso_area = iso_lc_chrom.sum()
 
     # if zero vectors, do not compute the cosine distance
-    if (mono_area==0) | (iso_area==0): return 0, 0, iso_area
+    if iso_area==0: return 0, 0, iso_area
 
     xic_cosine_sim = 1-cosine(mono_vec.flatten(), iso_vec.flatten())
     lc_cosine_sim = 1-cosine(mono_lc_chrom, iso_lc_chrom)
 
     return xic_cosine_sim, lc_cosine_sim, iso_area
 
+def check_charge_states(uimf_reader, local_peaks, target_info, num_peaks=10000, debug=False):
+    '''check out the charge states
+    '''
+    seq,_mz,mz,iso,z = target_info
+    _filtered_peaks = []
+    for peak in local_peaks:
+        frame_nums=range(peak['frame_start'],peak['frame_end'])
+        scan_nums=range(peak['scan']-10,peak['scan']+10)
+        charge_state, mz_arr, mz_int, valid_peak_idxs = uimf_reader.get_charge_state(mz, frame_nums, scan_nums)
+
+        if np.abs(charge_state-z)<1e-2:
+            ppm_errors = 1e6*np.abs(mz_arr[valid_peak_idxs]-mz)/mz
+            min_ppm_errors = ppm_errors.min()
+
+            temp = peak
+            temp['ppm_error'] = min_ppm_errors
+            
+            _filtered_peaks.append(temp)
+            if len(_filtered_peaks) == num_peaks: break
+        if debug:
+            print("charge_state:", charge_state)
+            print("m/z peaks:", mz_arr[valid_peak_idxs])
+            print('ppm_errors:', ppm_errors)
+            plt.plot(mz_arr, mz_int)
+            plt.plot(mz_arr[valid_peak_idxs], mz_int[valid_peak_idxs], "x")
+            plt.show()
+    return _filtered_peaks
+
+
+
 def filter_peaks_by_isotopes(local_peaks, xic_by_mzbin, mzbins_by_mz, mono_info, num_frames, num_scans, th_isotope_cosine):
+    '''filter by local peaks based on the isotope patterns
+    '''
     if len(local_peaks) == 0: return []
 
     seq,_mz,mz,iso,z = mono_info
+    info_m_minus_1 = find_mzbin_infos(mzbins_by_mz, seq, -1, z)
     info_m_plus_1 = find_mzbin_infos(mzbins_by_mz, seq, 1, z)
     info_m_plus_2 = find_mzbin_infos(mzbins_by_mz, seq, 2, z)
 
-    if (info_m_plus_1 is None) | (info_m_plus_2 is None): return []
+    if (info_m_minus_1 is None)| (info_m_plus_1 is None) | (info_m_plus_2 is None): return []
 
     rst = []
 
+    mzbin_m_minus_1 = mzbins_by_mz[info_m_minus_1]
     mzbin_m_plus_1 = mzbins_by_mz[info_m_plus_1]
     mzbin_m_plus_2 = mzbins_by_mz[info_m_plus_2]
 
     xic2d_mono = xic_matrix(xic_by_mzbin, mzbins_by_mz[mono_info], num_frames, num_scans, normalize=False)
+    xic2d_m_minus_1 = xic_matrix(xic_by_mzbin, mzbin_m_minus_1, num_frames, num_scans, normalize=False)
     xic2d_m_plus_1 = xic_matrix(xic_by_mzbin, mzbin_m_plus_1, num_frames, num_scans, normalize=False)
     xic2d_m_plus_2 = xic_matrix(xic_by_mzbin, mzbin_m_plus_2, num_frames, num_scans, normalize=False)
     
     for local_peak in local_peaks:
         peak_region = PeakRegion(local_peak['frame_start'], local_peak['frame_end'], local_peak['scan_start'], local_peak['scan_end'])
+
+        # extract mono peaks
+        mono_vec = xic2d_mono[peak_region.frame_start:peak_region.frame_end,peak_region.scan_start:peak_region.scan_end]
+        mono_lc_chrom = mono_vec.sum(axis=1)
+        # mono_mobility = mono_vec.sum(axis=0)
+        mono_area = mono_lc_chrom.sum()
+        if mono_area==0: continue
+
         # compute cosine similarity
-        xic_cosine_sim_1, lc_cosine_sim_1, iso_area1 = compute_isotope_cosine(xic2d_mono, xic2d_m_plus_1, peak_region)
+        xic_cosine_sim_m1, lc_cosine_sim_m1, iso_area_m1 = compute_isotope_cosine(mono_vec, mono_lc_chrom, xic2d_m_minus_1, peak_region)
+        xic_cosine_sim_1, lc_cosine_sim_1, iso_area1 = compute_isotope_cosine(mono_vec, mono_lc_chrom, xic2d_m_plus_1, peak_region)
         if lc_cosine_sim_1 < th_isotope_cosine: continue
-        xic_cosine_sim_2, lc_cosine_sim_2, iso_area2 = compute_isotope_cosine(xic2d_mono, xic2d_m_plus_2, peak_region)
+        xic_cosine_sim_2, lc_cosine_sim_2, iso_area2 = compute_isotope_cosine(mono_vec, mono_lc_chrom, xic2d_m_plus_2, peak_region)
         if lc_cosine_sim_2 < th_isotope_cosine: continue
 
         temp = local_peak
-        temp['M1_area'] = iso_area1
-        temp['M2_area'] = iso_area2
-        temp['M1_cosine'] = lc_cosine_sim_1
-        temp['M2_cosine'] = lc_cosine_sim_2
+        temp['M-1_area'] = iso_area_m1
+        temp['M+1_area'] = iso_area1
+        temp['M+2_area'] = iso_area2
+        temp['M-1_cosine'] = lc_cosine_sim_m1
+        temp['M+1_cosine'] = lc_cosine_sim_1
+        temp['M+2_cosine'] = lc_cosine_sim_2
         rst.append(temp)
-    #print("filter_peaks_by_isotopes:",len(rst))
     return rst
 
-def collect_target_peaks(xic_by_mzbin, mzbins_by_mz, target_infos, num_frames, num_scans,
+def collect_target_peaks(uimf_reader, xic_by_mzbin, mzbins_by_mz, target_infos, num_frames, num_scans,
                          global_min_distance=20, local_min_distance=15,
                          num_top_peaks=20, num_global_peaks=20,
                          frames_for_peak=20, scans_for_peak=20, masking_threshold=0.01,
@@ -509,7 +555,7 @@ def collect_target_peaks(xic_by_mzbin, mzbins_by_mz, target_infos, num_frames, n
         if mzbins_key in cache_peaks_by_mzbins:
             local_peaks = cache_peaks_by_mzbins[mzbins_key]
         else:
-            local_peaks = collect_peaks(xic_by_mzbin, target_mzbin, num_frames, num_scans,
+            local_peaks = collect_peaks(uimf_reader, xic_by_mzbin, target_mzbin, info, num_frames, num_scans,
                                         global_min_distance=global_min_distance, local_min_distance=local_min_distance,
                                         num_top_peaks=num_top_peaks, num_global_peaks=num_global_peaks,
                                         frames_for_peak=frames_for_peak, scans_for_peak=scans_for_peak,
@@ -540,7 +586,59 @@ def collect_target_peaks(xic_by_mzbin, mzbins_by_mz, target_infos, num_frames, n
     print("[%d/%d] (%d peaks) Dnoe: %.2f min" % (idx+1, n_targets, rdf.shape[0], (time.time()-stime)/60))
     return rdf
 
-def collect_heavy_targets(uimf, target_list_file, xic2d_file, ppm=20,
+def get_mz_peaks_target_mzbin(frame_arr, scan_arr, int_arr, target_mzbin, xic_by_mzbin, th=50):
+    for f, s, i in zip(frame_arr, scan_arr, int_arr):
+        bin_intensities = decode(decompress(i))
+        for idx, intensity in bin_intensities:
+            if intensity > th:
+                if idx in target_mzbin:
+                    if idx not in xic_by_mzbin: xic_by_mzbin[idx] = []
+                    xic_by_mzbin[idx].append([f,s,intensity])
+
+def get_target_peaks(reader, target_mzbins, sig_th=50, ofile=None):
+    stime = time.time()
+    xic_by_mzbin = dict()
+    chunk_size = 100
+    num_chunks = reader.num_frames//chunk_size
+
+    #### TODO: 
+    params = reader.calibration_params_by_frame[1]
+    slope, intercept = params['CalibrationSlope'], params['CalibrationIntercept']
+    target_mzbin = target_mzbins[(slope, intercept, reader.bin_width)]
+    #print('target_mzbin:', target_mzbin)
+
+    for i in range(num_chunks+1):
+        gc.disable()
+        start = i*chunk_size + 1
+        end = start + chunk_size
+        
+        df = reader.read_frame_scans(frame_nums=range(start,end))
+        if df.shape[0]>0:
+            get_mz_peaks_target_mzbin(df.FrameNum.values,
+                         df.ScanNum.values,
+                         df.Intensities.values,
+                         target_mzbin,
+                         xic_by_mzbin,
+                         sig_th)
+        print("[{0}-{1}] Done: Time: {2:.3f} s".format(
+            start,
+            end-1,
+            time.time()-stime))
+        gc.enable()
+
+    for mzbin in xic_by_mzbin:
+        _l = xic_by_mzbin[mzbin]
+        arr = np.array(_l)
+        xic_by_mzbin[mzbin] = coo_matrix((arr[:,2], (arr[:,0],arr[:,1])), shape=(reader.num_frames+1, reader.num_scans+1), dtype=np.uint32)
+        _l = None
+        arr = None
+    
+    # write a 2D XIC binned by m/z into pickle
+    if ofile is not None: write_pickle(xic_by_mzbin, ofile)
+    
+    return xic_by_mzbin
+
+def collect_heavy_targets(uimf, target_list_file, xic2d_file=None, ppm=20,
                           global_min_distance=20, local_min_distance=15,
                           num_top_peaks=20, num_global_peaks=5, moving_avg_size=20,
                           th_peak_area=1000, th_isotope_lc_cosine=0.85, masking_threshold=0.1,
@@ -565,20 +663,22 @@ def collect_heavy_targets(uimf, target_list_file, xic2d_file, ppm=20,
     
     # read the target lists
     target_df = read_target_list(target_list_file)
-    target_mzbins, mzbins_by_mz = collect_target_mzbins(target_df, reader.mz_calibrator_by_params, ppm=ppm, isotope=3, heavy_only=False)
+    target_mzbins, mzbins_by_mz = collect_target_mzbins(target_df, reader.mz_calibrator_by_params, ppm=ppm, isotope=2, heavy_only=False)
     
-    with open(xic2d_file, 'rb') as handle:
-        xic_by_mzbin = pickle.load(handle)
+    if xic2d_file:
+        with open(xic2d_file, 'rb') as handle:
+            xic_by_mzbin = pickle.load(handle)
+    else:
+        xic_by_mzbin = get_target_peaks(reader, target_mzbins, sig_th=0, ofile=None)
     print('# ready xic_by_mzbin file,', (time.time()-stime)/60, 'min')
     
     heavy_target_infos = find_heavy_mzbin_infos(mzbins_by_mz)
-    heavy_peaks = collect_target_peaks(xic_by_mzbin, mzbins_by_mz, heavy_target_infos, reader.num_frames, reader.num_scans,
+    heavy_peaks = collect_target_peaks(reader, xic_by_mzbin, mzbins_by_mz, heavy_target_infos, reader.num_frames, reader.num_scans,
                                        global_min_distance=global_min_distance, local_min_distance=local_min_distance,
                                        num_top_peaks=num_top_peaks, num_global_peaks=num_global_peaks,
                                        frames_for_peak=frames_for_peak, scans_for_peak=scans_for_peak, masking_threshold=masking_threshold,
                                        th_peak_area=th_peak_area, moving_avg_size=moving_avg_size, th_isotope_lc_cosine=th_isotope_lc_cosine)
     print('# collect_target_peaks, Done: ', (time.time()-stime)/60, 'min')
-    
     if fout: heavy_peaks.to_csv(fout)
     
     return heavy_peaks
@@ -628,7 +728,8 @@ if __name__ == "__main__":
     data_folder = 'data/'
     target_list_file = data_folder+'20190319-Slim charge1-5 light-heavy.xlsx'
 
-    for concen in [78, 156, 312, 625, 1250, 2500, 5000]:
+    # for concen in [78, 156, 312, 625, 1250, 2500, 5000]:
+    for concen in [5000]:
         uimf = data_folder+'LC_{0}_heavy_repA_1_MinInt5_DComp5.uimf'.format(concen)
         xic2d_file = data_folder+'LC_{0}_heavy_repA_1_MinInt5_DComp5_50ppm.pkl'.format(concen)
         if (frames_for_peak is None) | (scans_for_peak is None):
@@ -640,7 +741,7 @@ if __name__ == "__main__":
                     'LC_{0:d}_heavy_repA_1_MinInt5_DComp5_heavy_peaks_{1:d}ppm_area{2:d}_cosine{3:.2f}_f{4:d}_s{5:d}.csv'.format(
                         concen, ppm, th_peak_area, th_isotope_lc_cosine, frames_for_peak, scans_for_peak)
         
-        collect_heavy_targets(uimf, target_list_file, xic2d_file, 
+        collect_heavy_targets(uimf, target_list_file, xic2d_file=None, 
             ppm=ppm, global_min_distance=global_min_distance, local_min_distance=local_min_distance,
             num_top_peaks=num_top_peaks, num_global_peaks=num_global_peaks, moving_avg_size=moving_avg_size,
             th_peak_area=th_peak_area, th_isotope_lc_cosine=th_isotope_lc_cosine,
